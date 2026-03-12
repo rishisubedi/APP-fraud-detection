@@ -13,50 +13,48 @@ from typing import Dict, Any
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global state for ML model and SHAP explainer
+# Global state
 MODEL_PATH = os.getenv("MODEL_PATH", "models/xgb_fraud_model.json")
 ml_models = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager for FastAPI to load ML models efficiently on startup."""
-    logger.info(f"Loading model from {MODEL_PATH}")
+    """Lifecycle manager for FastAPI."""
+    logger.info(f"Loading advanced model from {MODEL_PATH}")
     if os.path.exists(MODEL_PATH):
         model = xgb.XGBClassifier()
         model.load_model(MODEL_PATH)
         ml_models["model"] = model
-        logger.info("Model loaded successfully.")
         
-        logger.info("Initializing SHAP explainer...")
-        # TreeExplainer is heavily optimized for XGBoost
+        logger.info("Initializing SHAP TreeExplainer...")
         ml_models["explainer"] = shap.TreeExplainer(model)
-        logger.info("SHAP explainer initialized.")
+        logger.info("Ready for inference.")
     else:
-        logger.warning(f"Model file not found at {MODEL_PATH}. Ensure the model is trained before hitting /predict.")
+        logger.warning(f"Model file not found at {MODEL_PATH}. Train the model first.")
     
-    yield  # Server runs while yielding
-    
-    # Cleanup resources on shutdown
+    yield
     ml_models.clear()
-    logger.info("Cleaned up ML models.")
 
 app = FastAPI(
-    title="APP Fraud Detection API",
-    description="Real-time Authorised Push Payment Fraud Detection API with SHAP Explanations for FCA regulatory compliance.",
-    version="1.0.0",
+    title="Advanced APP Fraud Detection API",
+    description="Real-time Financial API serving Extreme Gradient Boosting with SHAP Transparency.",
+    version="2.0.0",
     lifespan=lifespan
 )
 
-FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.80")) # Business logic threshold to block transactions
+FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.80"))
 
-# Pydantic models for request validation
+# Updated Schema matches the new advanced Data Generator features
 class TransactionRequest(BaseModel):
-    transaction_id: str = Field(..., description="Unique UUID for the transaction")
-    account_id: str = Field(..., description="Sender's account ID")
-    receiver_account_id: str = Field(..., description="Receiver's account ID")
-    amount_gbp: float = Field(..., ge=0, description="Transaction amount in British Pounds (GBP)")
-    is_new_payee: bool = Field(..., description="True if the receiver is a new payee, False otherwise")
-    device_risk_score: float = Field(..., ge=0, le=100, description="Risk score (0-100) from device telemetry")
+    transaction_id: str = Field(...)
+    sender_account_id: str = Field(...)
+    receiver_account_id: str = Field(...)
+    amount_gbp: float = Field(..., ge=0)
+    is_new_payee: bool = Field(...)
+    device_risk_score: float = Field(..., ge=0, le=100)
+    # New Velocity/Engineered Features that we assume the feature-store injects before hitting the model
+    time_since_last_tx_seconds: float = Field(..., description="Seconds since the sender's last transfer")
+    sender_tx_count_24h: int = Field(..., ge=0, description="Number of transfers by the sender in the last 24h")
 
 class FraudResponse(BaseModel):
     transaction_id: str
@@ -66,73 +64,59 @@ class FraudResponse(BaseModel):
 
 @app.post("/predict", response_model=FraudResponse)
 async def predict_fraud(transaction: TransactionRequest):
-    """
-    Predict the probability of APP fraud for a given transaction and explain the decision.
-    """
     model = ml_models.get("model")
     explainer = ml_models.get("explainer")
     
-    if model is None or explainer is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Model is currently unavailable. Please ensure the model file is accessible and restart the server."
-        )
+    if not model or not explainer:
+        raise HTTPException(status_code=503, detail="Model unavailable.")
 
-    # Note: Column order MUST exactly match the order used during training in train.py
-    feature_names = ['amount_gbp', 'is_new_payee', 'device_risk_score']
+    # Must match train.py drop_cols
+    feature_names = [
+        'amount_gbp',
+        'is_new_payee',
+        'device_risk_score',
+        'time_since_last_tx_seconds',
+        'sender_tx_count_24h'
+    ]
     
-    # Convert bool to int for XGBoost
     features_dict = {
         'amount_gbp': [transaction.amount_gbp],
         'is_new_payee': [1 if transaction.is_new_payee else 0],
-        'device_risk_score': [transaction.device_risk_score]
+        'device_risk_score': [transaction.device_risk_score],
+        'time_since_last_tx_seconds': [transaction.time_since_last_tx_seconds],
+        'sender_tx_count_24h': [transaction.sender_tx_count_24h]
     }
     
     input_df = pd.DataFrame(features_dict, columns=feature_names)
     
     try:
-        # 1. Predict Fraud Probability
-        # predict_proba returns a 2D array, we want the probability of class 1 (Fraud)
-        prob = model.predict_proba(input_df)[0, 1]
+        prob = float(model.predict_proba(input_df)[0, 1])
         
-        # 2. Extract SHAP Explanations for Compliance
-        # shap_values represents how much each feature pushes the prediction log-odds
+        # Extract SHAP
         shap_values = explainer.shap_values(input_df)
-        
-        # For Binary Classification, shap_values might be 1D or 2D depending on xgboost version/objective
-        # Typically for binary logistic, it's 1D per instance.
         instance_shap = shap_values[0] if len(shap_values.shape) == 2 else shap_values
         
         reasons = {name: float(val) for name, val in zip(feature_names, instance_shap)}
-        
-        # We define "top reasons" as the features that strongly pushed the model towards FRAUD (positive SHAP).
-        # We'll return the positive contributors sorted by impact.
         top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: item[1], reverse=True) if v > 0}
         
-        # If there are no positive contributors (very clean transaction), return the most important mitigating factors
         if not top_reasons:
             top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: abs(item[1]), reverse=True)}
 
-        # 3. Apply Decision Engine Rule
         block = bool(prob >= FRAUD_THRESHOLD)
         
-        logger.info(f"Transaction {transaction.transaction_id} processed: score={prob:.3f}, block={block}")
+        logger.info(f"Tx {transaction.transaction_id}: score={prob:.3f}, block={block}")
         
         return FraudResponse(
             transaction_id=transaction.transaction_id,
-            fraud_probability_score=float(prob),
+            fraud_probability_score=prob,
             block_transaction=block,
             top_reasons=top_reasons
         )
             
     except Exception as e:
-        logger.error(f"Error during prediction pipeline: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal prediction error: {str(e)}")
+        logger.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    """Liveness probe for Kubernetes / Container Orchestration."""
-    return {
-        "status": "healthy",
-        "model_loaded": "model" in ml_models
-    }
+    return {"status": "healthy"}

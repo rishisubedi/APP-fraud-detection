@@ -1,62 +1,84 @@
 import pandas as pd
 import numpy as np
 from faker import Faker
-from datetime import datetime, timedelta
+from datetime import timedelta
 import os
 import logging
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def generate_synthetic_data(num_records: int = 100000, fraud_ratio: float = 0.01) -> pd.DataFrame:
+def generate_advanced_synthetic_data(num_records: int = 60000, fraud_ratio: float = 0.015) -> pd.DataFrame:
     """
-    Generate synthetic UK banking transactions with injected APP fraud patterns.
-    
-    Args:
-        num_records (int): Number of total transactions to generate.
-        fraud_ratio (float): Approximate ratio of fraudulent transactions.
-        
-    Returns:
-        pd.DataFrame: DataFrame containing synthetic transactions.
+    Generate synthetic UK banking transactions injecting advanced APP fraud features.
+    Features include velocity metrics and basic network analysis mimicking a mule network.
     """
-    logger.info(f"Generating {num_records} synthetic transactions...")
+    logger.info(f"Generating {num_records} synthetic transactions with advanced features...")
     fake = Faker('en_GB')
     np.random.seed(42)
     Faker.seed(42)
     
-    # Generate base features
-    timestamps = [fake.date_time_between(start_date='-60d', end_date='now') for _ in range(num_records)]
+    # Generate tightly clustered timestamps (for velocity calculations)
+    start_date = pd.Timestamp.now() - pd.Timedelta(days=30)
+    timestamps = [start_date + pd.Timedelta(minutes=np.random.exponential(scale=30)) for _ in range(num_records)]
+    timestamps.sort()
     
+    # Establish a pool of accounts to simulate network behavior
+    num_accounts = num_records // 10
+    account_pool = [str(fake.random_int(min=100000, max=999999)) for _ in range(num_accounts)]
+    
+    # Define a small pool of known 'fraudsters' (mule accounts)
+    num_mules = max(1, int(num_accounts * 0.05))
+    mule_accounts = np.random.choice(account_pool, size=num_mules, replace=False)
+
     data = {
-        'transaction_id': [fake.uuid4() for _ in range(num_records)],
-        'account_id': np.random.randint(10000, 99999, size=num_records).astype(str),
-        'receiver_account_id': np.random.randint(10000, 99999, size=num_records).astype(str),
-        'amount_gbp': np.round(np.random.lognormal(mean=4.0, sigma=1.2, size=num_records), 2),
+        'transaction_id': [str(uuid.uuid4()) for _ in range(num_records)],
+        'sender_account_id': np.random.choice(account_pool, size=num_records),
+        'receiver_account_id': np.random.choice(account_pool, size=num_records),
+        'amount_gbp': np.round(np.random.lognormal(mean=4.5, sigma=1.2, size=num_records), 2),
         'timestamp': timestamps,
-        'is_new_payee': np.random.choice([0, 1], size=num_records, p=[0.8, 0.2]),
-        'device_risk_score': np.round(np.random.uniform(0, 100, size=num_records), 2),
+        'is_new_payee': np.random.choice([0, 1], size=num_records, p=[0.7, 0.3]),
+        'device_risk_score': np.round(np.random.uniform(0, 50, size=num_records), 2),
         'is_fraud': np.zeros(num_records, dtype=int)
     }
     
     df = pd.DataFrame(data)
     
-    # Inject APP Fraud Patterns
-    # Pattern 1: High value transfers to new payees late at night (11 PM - 4 AM)
-    df['hour'] = df['timestamp'].dt.hour
-    late_night_mask = (df['hour'] >= 23) | (df['hour'] <= 4)
-    high_value_mask = df['amount_gbp'] > 2000
-    new_payee_mask = df['is_new_payee'] == 1
+    # Prevent self-transfers
+    df.loc[df['sender_account_id'] == df['receiver_account_id'], 'receiver_account_id'] = \
+        df['receiver_account_id'].apply(lambda _: str(fake.random_int(min=100000, max=999999)))
+
+    # --- ADVANCED FEATURE INJECTION ---
     
-    pattern1_mask = late_night_mask & high_value_mask & new_payee_mask
+    # 1. Network Feature: Multiple senders to a single mule (The "Drop Account" pattern)
+    logger.info("Injecting Network Features (Mule accounts)...")
+    mule_mask = df['receiver_account_id'].isin(mule_accounts) & (df['is_new_payee'] == 1)
     
-    # Pattern 2: Very high device risk score with new payee
-    pattern2_mask = (df['device_risk_score'] > 90) & (df['is_new_payee'] == 1) & (df['amount_gbp'] > 500)
+    df.loc[mule_mask, 'amount_gbp'] = df.loc[mule_mask, 'amount_gbp'] * 1.5 # mules get larger drops
+    df.loc[mule_mask, 'device_risk_score'] = np.clip(df.loc[mule_mask, 'device_risk_score'] + 40, 0, 100)
     
-    # Apply fraud labels based on patterns
+    # 2. Velocity Feature generation (Simulating real-time streaming counters)
+    logger.info("Computing Velocity Features...")
+    df = df.sort_values(by=['sender_account_id', 'timestamp'])
+    
+    # Time since last transaction by this sender
+    df['time_since_last_tx_seconds'] = df.groupby('sender_account_id')['timestamp'].diff().dt.total_seconds().fillna(86400)
+    
+    # Count of transactions by this sender in the last 24 hours (simulated using rolling window)
+    df = df.set_index('timestamp')
+    df['sender_tx_count_24h'] = df.groupby('sender_account_id')['transaction_id'].rolling('24h').count().reset_index(level=0, drop=True)
+    df = df.reset_index()
+
+    # Define Velocity Fraud Pattern: Rapid consecutive transfers (e.g. less than 5 minutes apart) to a new payee
+    velocity_fraud_mask = (df['time_since_last_tx_seconds'] < 300) & (df['is_new_payee'] == 1) & (df['amount_gbp'] > 1000)
+    
+    # Finalize Fraud Labels Based on Patterns
     num_frauds_needed = int(num_records * fraud_ratio)
     
-    fraud_candidates = df[pattern1_mask | pattern2_mask].index
+    fraud_candidates = df[mule_mask | velocity_fraud_mask].index.tolist()
+    
     if len(fraud_candidates) > num_frauds_needed:
         selected_frauds = np.random.choice(fraud_candidates, size=num_frauds_needed, replace=False)
     else:
@@ -64,31 +86,22 @@ def generate_synthetic_data(num_records: int = 100000, fraud_ratio: float = 0.01
         
     df.loc[selected_frauds, 'is_fraud'] = 1
     
-    # Also add some random frauds to make it realistic
-    remaining_frauds = max(0, num_frauds_needed - len(selected_frauds))
-    if remaining_frauds > 0:
-        non_fraud_indices = df[df['is_fraud'] == 0].index
-        random_frauds = np.random.choice(non_fraud_indices, size=remaining_frauds, replace=False)
-        df.loc[random_frauds, 'is_fraud'] = 1
-
-    df = df.drop(columns=['hour'])
-    
-    logger.info(f"Generated data with target distribution:\n{df['is_fraud'].value_counts(normalize=True)}")
+    logger.info(f"Target distribution after injection:\n{df['is_fraud'].value_counts(normalize=True)}")
     return df
 
 def main():
     try:
-        df = generate_synthetic_data(num_records=50000, fraud_ratio=0.015)
+        df = generate_advanced_synthetic_data(num_records=75000, fraud_ratio=0.012)
         
         # Ensure output directory exists
         output_dir = 'data'
         os.makedirs(output_dir, exist_ok=True)
         
-        output_path = os.path.join(output_dir, 'transactions.csv')
+        output_path = os.path.join(output_dir, 'raw_transactions.csv')
         df.to_csv(output_path, index=False)
-        logger.info(f"Synthetic data saved successfully to {output_path}")
+        logger.info(f"Advanced synthetic data saved successfully to {output_path}")
     except Exception as e:
-        logger.error(f"Error generating data: {str(e)}")
+        logger.error(f"Error generating advanced data: {str(e)}")
         raise
 
 if __name__ == "__main__":
