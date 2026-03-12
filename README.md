@@ -129,3 +129,20 @@ While this project demonstrates a highly robust foundational architecture, scali
 2.  **Streaming Aggregations (Kafka/Flink):** Upgrading from static batch feature generation to robust event-driven stream processing using Apache Flink to calculate velocity rules and graph-based features incrementally.
 3.  **Graph Neural Networks (GNNs):** Fraud rings are highly interconnected. Adding a GNN (e.g., using DGL or PyG) alongside XGBoost would allow the model to catch money mule networks by analyzing the *relationships* between sending and receiving accounts before the money moves.
 4.  **Shadow Deployment & A/B Testing:** Implementing routing logic (via a mesh like Istio or Envoy) to deploy new model versions in "shadow mode" to evaluate prediction drift and business metrics safely before promoting to blocking mode.
+
+## 📈 Model Performance Results
+
+Our cost-sensitive XGBoost pipeline automatically evaluates itself upon training to ensure production readiness against highly imbalanced fraud typologies.
+
+*   **Precision-Recall AUC:** `0.1056`
+*   **Total Expected GBP Saved (Test Set):** `£60,742.75`
+
+### Precision-Recall Analysis
+The PR-AUC is the gold standard for heavily imbalanced datasets like APP fraud, indicating the trade-off between accurately identifying fraud (Recall) and minimizing customer friction from false positives (Precision).
+
+![Precision-Recall Curve](assets/pr_curve.png)
+
+### Explainable AI (SHAP) Compliance
+To comply with FCA/PSR regulations regarding algorithmic transparency, we extract SHapley Additive exPlanations feature importances globally. This proves to stakeholders *which* engineered velocity and network features are driving model decisions.
+
+![SHAP Summary Plot](assets/shap_summary.png)
