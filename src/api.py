@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import xgboost as xgb
@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 import os
 import logging
+import asyncio
+import time
 from typing import Dict, Any
 
 # Configure logging
@@ -38,13 +40,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Advanced APP Fraud Detection API",
     description="Real-time Financial API serving Extreme Gradient Boosting with SHAP Transparency.",
-    version="2.0.0",
+    version="2.1.0", # Bumped version for concurrency patch
     lifespan=lifespan
 )
 
+# --- LATENCY TRACKING MIDDLEWARE ---
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    response.headers["X-Process-Time-Ms"] = str(round(process_time * 1000, 2))
+    # In production, this would emit to Datadog/Prometheus
+    if request.url.path == "/predict":
+        logger.info(f"Inference Latency: {process_time * 1000:.2f} ms")
+    return response
+
 FRAUD_THRESHOLD = float(os.getenv("FRAUD_THRESHOLD", "0.80"))
 
-# Updated Schema matches the new advanced Data Generator features
 class TransactionRequest(BaseModel):
     transaction_id: str = Field(...)
     sender_account_id: str = Field(...)
@@ -52,7 +65,6 @@ class TransactionRequest(BaseModel):
     amount_gbp: float = Field(..., ge=0)
     is_new_payee: bool = Field(...)
     device_risk_score: float = Field(..., ge=0, le=100)
-    # New Velocity/Engineered Features that we assume the feature-store injects before hitting the model
     time_since_last_tx_seconds: float = Field(..., description="Seconds since the sender's last transfer")
     sender_tx_count_24h: int = Field(..., ge=0, description="Number of transfers by the sender in the last 24h")
 
@@ -62,6 +74,25 @@ class FraudResponse(BaseModel):
     block_transaction: bool
     top_reasons: Dict[str, float]
 
+def run_ml_inference(model: xgb.XGBClassifier, explainer: shap.TreeExplainer, input_df: pd.DataFrame, feature_names: list) -> FraudResponse:
+    """
+    CPU-Bound ML computation isolated for ThreadPool execution.
+    Prevents the XGBoost and SHAP calculations from blocking FastAPI's async event loop.
+    """
+    prob = float(model.predict_proba(input_df)[0, 1])
+    
+    # Extract SHAP (Computationally expensive)
+    shap_values = explainer.shap_values(input_df)
+    instance_shap = shap_values[0] if len(shap_values.shape) == 2 else shap_values
+    
+    reasons = {name: float(val) for name, val in zip(feature_names, instance_shap)}
+    top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: item[1], reverse=True) if v > 0}
+    
+    if not top_reasons:
+        top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: abs(item[1]), reverse=True)}
+
+    return prob, top_reasons
+
 @app.post("/predict", response_model=FraudResponse)
 async def predict_fraud(transaction: TransactionRequest):
     model = ml_models.get("model")
@@ -70,7 +101,6 @@ async def predict_fraud(transaction: TransactionRequest):
     if not model or not explainer:
         raise HTTPException(status_code=503, detail="Model unavailable.")
 
-    # Must match train.py drop_cols
     feature_names = [
         'amount_gbp',
         'is_new_payee',
@@ -90,21 +120,13 @@ async def predict_fraud(transaction: TransactionRequest):
     input_df = pd.DataFrame(features_dict, columns=feature_names)
     
     try:
-        prob = float(model.predict_proba(input_df)[0, 1])
-        
-        # Extract SHAP
-        shap_values = explainer.shap_values(input_df)
-        instance_shap = shap_values[0] if len(shap_values.shape) == 2 else shap_values
-        
-        reasons = {name: float(val) for name, val in zip(feature_names, instance_shap)}
-        top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: item[1], reverse=True) if v > 0}
-        
-        if not top_reasons:
-            top_reasons = {k: v for k, v in sorted(reasons.items(), key=lambda item: abs(item[1]), reverse=True)}
+        # OPTIMIZATION: Offload CPU-heavy XGBoost/SHAP to a background thread.
+        # This allows the ASGI event loop to process thousands of concurrent requests.
+        prob, top_reasons = await asyncio.to_thread(
+            run_ml_inference, model, explainer, input_df, feature_names
+        )
 
         block = bool(prob >= FRAUD_THRESHOLD)
-        
-        logger.info(f"Tx {transaction.transaction_id}: score={prob:.3f}, block={block}")
         
         return FraudResponse(
             transaction_id=transaction.transaction_id,
